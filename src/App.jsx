@@ -390,3 +390,17 @@ export default function App() {
     </div>
   );
 }
+<button
+  onClick={() => {
+    const synth = window.speechSynthesis;
+    const u = new SpeechSynthesisUtterance("Voice test successful.");
+    u.lang = "en-US";
+    u.volume = 1;
+    u.rate = 1;
+    u.pitch = 1;
+    synth.cancel();
+    synth.speak(u);
+  }}
+>
+  Test Voice
+</button>
