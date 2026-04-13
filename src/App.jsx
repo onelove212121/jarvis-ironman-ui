@@ -3,7 +3,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 const SpeechRecognition =
   window.SpeechRecognition || window.webkitSpeechRecognition;
 
-const PARTICLE_COUNT = 70;
+const PARTICLE_COUNT = 88;
 
 function randomBetween(min, max) {
   return Math.random() * (max - min) + min;
@@ -13,11 +13,11 @@ function createParticles() {
   return Array.from({ length: PARTICLE_COUNT }, (_, i) => ({
     id: i,
     angle: randomBetween(0, Math.PI * 2),
-    radius: randomBetween(70, 170),
-    size: randomBetween(3, 8),
-    speed: randomBetween(0.002, 0.01),
-    drift: randomBetween(-0.35, 0.35),
-    twinkle: randomBetween(0.4, 1),
+    radius: randomBetween(80, 175),
+    size: randomBetween(2.5, 7),
+    speed: randomBetween(0.0015, 0.0065),
+    drift: randomBetween(-0.22, 0.22),
+    twinkle: randomBetween(0.35, 1),
     offset: randomBetween(0, 1000),
   }));
 }
@@ -25,34 +25,58 @@ function createParticles() {
 export default function App() {
   const [mode, setMode] = useState("boot");
   const [activated, setActivated] = useState(false);
-  const [heardText, setHeardText] = useState("");
-  const [replyText, setReplyText] = useState("");
   const [tick, setTick] = useState(0);
+  const [audioEnergy, setAudioEnergy] = useState(0.12);
+
+  const particles = useMemo(() => createParticles(), []);
 
   const recognitionRef = useRef(null);
   const shouldKeepListeningRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const lastFinalTranscriptRef = useRef("");
-  const animationRef = useRef(null);
-  const particlesRef = useRef(createParticles());
-
-  const particles = useMemo(() => particlesRef.current, []);
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const mediaSourceRef = useRef(null);
+  const speechPulseRef = useRef(0);
+  const restartTimeoutRef = useRef(null);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
+    mountedRef.current = true;
     let frame;
-    const loop = () => {
+    const animate = () => {
       setTick((t) => (t + 1) % 1000000);
-      frame = requestAnimationFrame(loop);
+      frame = requestAnimationFrame(animate);
     };
-    frame = requestAnimationFrame(loop);
-    animationRef.current = frame;
-    return () => cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(animate);
+
+    return () => {
+      mountedRef.current = false;
+      cancelAnimationFrame(frame);
+      if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
+      window.speechSynthesis?.cancel();
+      try {
+        recognitionRef.current?.stop();
+      } catch {}
+      try {
+        mediaSourceRef.current?.disconnect();
+      } catch {}
+      try {
+        analyserRef.current?.disconnect();
+      } catch {}
+      try {
+        mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      } catch {}
+      try {
+        audioContextRef.current?.close();
+      } catch {}
+    };
   }, []);
 
   useEffect(() => {
-    if (!SpeechRecognition) {
-      return;
-    }
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass || !SpeechRecognition) return;
 
     const recognition = new SpeechRecognition();
     recognition.continuous = true;
@@ -60,22 +84,20 @@ export default function App() {
     recognition.lang = "en-US";
 
     recognition.onstart = () => {
-      setMode("listening");
+      if (!mountedRef.current) return;
+      if (!isSpeakingRef.current) setMode("listening");
     };
 
     recognition.onresult = (event) => {
-      let transcript = "";
-      let finalText = "";
+      if (isSpeakingRef.current) return;
 
+      let finalText = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const piece = event.results[i][0].transcript.trim();
-        transcript += piece + " ";
         if (event.results[i].isFinal) {
           finalText += piece + " ";
         }
       }
-
-      setHeardText(transcript.trim());
 
       const cleanFinal = finalText.trim();
       if (
@@ -89,83 +111,119 @@ export default function App() {
     };
 
     recognition.onerror = () => {
+      if (!mountedRef.current) return;
       setMode("error");
     };
 
     recognition.onend = () => {
-      if (shouldKeepListeningRef.current && !isSpeakingRef.current) {
-        setTimeout(() => {
+      if (!mountedRef.current) return;
+      if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
+      if (shouldKeepListeningRef.current) {
+        restartTimeoutRef.current = setTimeout(() => {
           try {
             recognition.start();
           } catch {}
-        }, 400);
+        }, 1200);
       }
     };
 
     recognitionRef.current = recognition;
-
-    return () => {
-      shouldKeepListeningRef.current = false;
-      try {
-        recognition.stop();
-      } catch {}
-    };
   }, []);
 
-  const premiumBeep = () => {
+  useEffect(() => {
+    let frame;
+    const sampleAudio = () => {
+      const analyser = analyserRef.current;
+      let micLevel = 0;
+
+      if (analyser) {
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteTimeDomainData(data);
+
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) {
+          const normalized = (data[i] - 128) / 128;
+          sum += normalized * normalized;
+        }
+        micLevel = Math.min(1, Math.sqrt(sum / data.length) * 3.8);
+      }
+
+      speechPulseRef.current *= 0.88;
+      const combined = Math.max(micLevel, speechPulseRef.current);
+
+      setAudioEnergy((prev) => prev * 0.82 + combined * 0.18);
+      frame = requestAnimationFrame(sampleAudio);
+    };
+
+    frame = requestAnimationFrame(sampleAudio);
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
+  const setupMicEnergy = async () => {
+    if (mediaStreamRef.current) return true;
+
     try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextClass) return;
-      const ctx = new AudioContextClass();
-      const now = ctx.currentTime;
+      const context = new AudioContextClass();
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.88;
 
-      const osc1 = ctx.createOscillator();
-      const osc2 = ctx.createOscillator();
-      const gain = ctx.createGain();
+      const source = context.createMediaStreamSource(stream);
+      source.connect(analyser);
 
-      osc1.type = "sine";
-      osc2.type = "triangle";
-      osc1.frequency.setValueAtTime(740, now);
-      osc2.frequency.setValueAtTime(1110, now);
+      mediaStreamRef.current = stream;
+      audioContextRef.current = context;
+      analyserRef.current = analyser;
+      mediaSourceRef.current = source;
 
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.05, now + 0.03);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.38);
-
-      osc1.connect(gain);
-      osc2.connect(gain);
-      gain.connect(ctx.destination);
-
-      osc1.start(now);
-      osc2.start(now + 0.02);
-      osc1.stop(now + 0.4);
-      osc2.stop(now + 0.36);
-    } catch {}
+      return true;
+    } catch {
+      setMode("error");
+      return false;
+    }
   };
 
-  const startJarvis = () => {
+  const startJarvis = async () => {
     if (!recognitionRef.current) return;
+
+    const micReady = await setupMicEnergy();
+    if (!micReady) return;
+
     shouldKeepListeningRef.current = true;
     setActivated(true);
     setMode("awakening");
-    premiumBeep();
+
+    if (audioContextRef.current?.state === "suspended") {
+      try {
+        await audioContextRef.current.resume();
+      } catch {}
+    }
 
     setTimeout(() => {
       try {
         recognitionRef.current.start();
       } catch {}
-    }, 500);
+    }, 900);
   };
 
   const handleCommand = (command) => {
     setMode("thinking");
 
+    const thinkingDelay = 700 + Math.min(800, command.length * 8);
     setTimeout(() => {
       const response = `Acknowledged. ${command}`;
-      setReplyText(response);
       setMode("speaking");
       speak(response);
-    }, 900);
+    }, thinkingDelay);
   };
 
   const speak = (text) => {
@@ -178,26 +236,28 @@ export default function App() {
     synth.cancel();
     isSpeakingRef.current = true;
 
-    try {
-      recognitionRef.current?.stop();
-    } catch {}
-
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.pitch = 0.92;
-    utterance.rate = 0.98;
+    utterance.pitch = 0.94;
+    utterance.rate = 0.96;
     utterance.volume = 1;
+
+    utterance.onstart = () => {
+      setMode("speaking");
+      speechPulseRef.current = 0.55;
+    };
+
+    utterance.onboundary = () => {
+      speechPulseRef.current = 0.95;
+    };
 
     utterance.onend = () => {
       isSpeakingRef.current = false;
+      speechPulseRef.current = 0.15;
       lastFinalTranscriptRef.current = "";
-      setMode("listening");
-
       if (shouldKeepListeningRef.current) {
-        setTimeout(() => {
-          try {
-            recognitionRef.current?.start();
-          } catch {}
-        }, 450);
+        setMode("listening");
+      } else {
+        setMode("boot");
       }
     };
 
@@ -212,23 +272,90 @@ export default function App() {
   const getModeConfig = () => {
     switch (mode) {
       case "awakening":
-        return { spread: 55, glow: 1.1, jitter: 0.4, speedBoost: 1.5, opacity: 0.95 };
+        return {
+          spread: 72,
+          glow: 0.95,
+          jitter: 0.2,
+          speedBoost: 1.12,
+          opacity: 0.9,
+          waveA: 0.35,
+          waveB: 0.22,
+          rotationA: 0.018,
+          rotationB: 0.015,
+          scalePulse: 0.08,
+        };
       case "listening":
-        return { spread: 155, glow: 1, jitter: 1.2, speedBoost: 1.1, opacity: 0.9 };
+        return {
+          spread: 162,
+          glow: 1,
+          jitter: 0.32,
+          speedBoost: 1.15,
+          opacity: 0.95,
+          waveA: 0.65,
+          waveB: 0.42,
+          rotationA: 0.026,
+          rotationB: 0.018,
+          scalePulse: 0.12,
+        };
       case "thinking":
-        return { spread: 62, glow: 1.45, jitter: 0.25, speedBoost: 0.7, opacity: 1 };
+        return {
+          spread: 58,
+          glow: 1.18,
+          jitter: 0.08,
+          speedBoost: 0.72,
+          opacity: 1,
+          waveA: 0.18,
+          waveB: 0.08,
+          rotationA: 0.01,
+          rotationB: 0.008,
+          scalePulse: 0.05,
+        };
       case "speaking":
-        return { spread: 118, glow: 1.3, jitter: 0.65, speedBoost: 1.25, opacity: 1 };
+        return {
+          spread: 120,
+          glow: 1.28,
+          jitter: 0.18,
+          speedBoost: 1.08,
+          opacity: 1,
+          waveA: 0.78,
+          waveB: 0.55,
+          rotationA: 0.02,
+          rotationB: 0.014,
+          scalePulse: 0.22,
+        };
       case "error":
-        return { spread: 78, glow: 0.8, jitter: 2.1, speedBoost: 1.8, opacity: 0.7 };
+        return {
+          spread: 86,
+          glow: 0.72,
+          jitter: 0.55,
+          speedBoost: 1.35,
+          opacity: 0.72,
+          waveA: 0.4,
+          waveB: 0.18,
+          rotationA: 0.034,
+          rotationB: 0.026,
+          scalePulse: 0.1,
+        };
       case "boot":
       default:
-        return { spread: 135, glow: 0.85, jitter: 0.5, speedBoost: 1, opacity: 0.75 };
+        return {
+          spread: 138,
+          glow: 0.78,
+          jitter: 0.14,
+          speedBoost: 0.95,
+          opacity: 0.78,
+          waveA: 0.24,
+          waveB: 0.12,
+          rotationA: 0.014,
+          rotationB: 0.011,
+          scalePulse: 0.06,
+        };
     }
   };
 
   const config = getModeConfig();
   const time = tick * 0.016;
+  const energyBoost = 1 + audioEnergy * (mode === "thinking" ? 0.35 : 1.3);
 
   return (
     <div
@@ -238,7 +365,7 @@ export default function App() {
         width: "100vw",
         overflow: "hidden",
         background:
-          "radial-gradient(circle at center, rgba(120,20,20,0.16) 0%, rgba(20,0,0,0.28) 28%, #020202 65%, #000 100%)",
+          "radial-gradient(circle at center, rgba(255,255,255,0.07) 0%, rgba(255,255,255,0.025) 18%, rgba(12,12,14,0.98) 58%, #050505 100%)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -252,10 +379,13 @@ export default function App() {
           position: "absolute",
           inset: 0,
           background:
-            "radial-gradient(circle at center, rgba(255,70,70,0.08), rgba(255,0,0,0.02) 18%, rgba(0,0,0,0) 40%)",
-          filter: "blur(18px)",
-          transform: mode === "thinking" ? "scale(0.9)" : "scale(1)",
-          transition: "transform 500ms ease, opacity 500ms ease",
+            "radial-gradient(circle at center, rgba(255,255,255,0.09), rgba(255,255,255,0.025) 18%, rgba(0,0,0,0) 42%)",
+          filter: `blur(${18 + audioEnergy * 12}px)`,
+          transform:
+            mode === "thinking"
+              ? `scale(${0.88 + audioEnergy * 0.08})`
+              : `scale(${1 + audioEnergy * 0.05})`,
+          transition: "transform 240ms ease, opacity 240ms ease, filter 240ms ease",
           opacity: activated ? 1 : 0.7,
         }}
       />
@@ -263,25 +393,34 @@ export default function App() {
       <div
         style={{
           position: "relative",
-          width: 360,
-          height: 360,
+          width: 380,
+          height: 380,
         }}
       >
-        {particles.map((p, i) => {
+        {particles.map((p) => {
           const phase = time * (p.speed * 100) * config.speedBoost + p.offset;
-          const wanderingX = Math.cos(phase * 0.7 + p.drift) * config.jitter * 18;
-          const wanderingY = Math.sin(phase * 0.9 - p.drift) * config.jitter * 18;
-          const radiusWave = Math.sin(phase * 0.45) * 18;
-          const activeRadius = Math.max(18, (p.radius / 170) * config.spread + radiusWave);
-          const x = Math.cos(p.angle + phase * 0.05) * activeRadius + wanderingX;
-          const y = Math.sin(p.angle - phase * 0.04) * activeRadius + wanderingY;
+          const wanderingX =
+            Math.cos(phase * (0.45 + config.waveA) + p.drift) * config.jitter * 22 +
+            Math.sin(phase * 0.18 + p.offset) * config.jitter * 10;
+          const wanderingY =
+            Math.sin(phase * (0.5 + config.waveB) - p.drift) * config.jitter * 22 +
+            Math.cos(phase * 0.16 + p.offset) * config.jitter * 10;
+          const radiusWave =
+            Math.sin(phase * (0.16 + config.waveA * 0.15)) * 16 +
+            Math.cos(phase * (0.11 + config.waveB * 0.1)) * 10;
+          const activeRadius = Math.max(
+            16,
+            ((p.radius / 175) * config.spread + radiusWave) * energyBoost
+          );
+          const x =
+            Math.cos(p.angle + phase * config.rotationA) * activeRadius + wanderingX;
+          const y =
+            Math.sin(p.angle - phase * config.rotationB) * activeRadius + wanderingY;
           const scale =
-            mode === "thinking"
-              ? 0.92 + Math.sin(phase) * 0.08
-              : mode === "speaking"
-              ? 1 + Math.sin(phase * 1.3) * 0.25
-              : 1 + Math.sin(phase) * 0.12;
-          const alpha = Math.max(0.18, Math.min(1, p.twinkle * config.opacity));
+            1 +
+            Math.sin(phase * (0.7 + config.waveA * 0.2)) * config.scalePulse +
+            audioEnergy * 0.6;
+          const alpha = Math.max(0.14, Math.min(1, p.twinkle * config.opacity + audioEnergy * 0.25));
 
           return (
             <div
@@ -290,17 +429,14 @@ export default function App() {
                 position: "absolute",
                 left: "50%",
                 top: "50%",
-                width: p.size,
-                height: p.size,
+                width: p.size + audioEnergy * 2.4,
+                height: p.size + audioEnergy * 2.4,
                 borderRadius: "999px",
                 transform: `translate(${x}px, ${y}px) scale(${scale})`,
-                background:
-                  mode === "error"
-                    ? `rgba(255,90,90,${alpha})`
-                    : `rgba(255,120,120,${alpha})`,
-                boxShadow: `0 0 ${10 * config.glow}px rgba(255,70,70,${Math.min(0.95, alpha)})`,
+                background: `rgba(255,255,255,${alpha})`,
+                boxShadow: `0 0 ${14 * config.glow + audioEnergy * 18}px rgba(255,255,255,${Math.min(0.96, alpha)})`,
                 filter: "blur(0.2px)",
-                transition: "background 220ms ease, box-shadow 220ms ease",
+                transition: "background 120ms linear, box-shadow 120ms linear, width 120ms linear, height 120ms linear",
               }}
             />
           );
@@ -316,10 +452,10 @@ export default function App() {
             transform: "translateX(-50%)",
             padding: "14px 20px",
             borderRadius: 999,
-            border: "1px solid rgba(255,255,255,0.08)",
-            background: "rgba(255,255,255,0.04)",
+            border: "1px solid rgba(255,255,255,0.09)",
+            background: "rgba(255,255,255,0.045)",
             backdropFilter: "blur(12px)",
-            color: "rgba(255,245,245,0.92)",
+            color: "rgba(255,255,255,0.9)",
             fontSize: 14,
             letterSpacing: "0.03em",
             textAlign: "center",
