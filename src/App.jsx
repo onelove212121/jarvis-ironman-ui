@@ -216,6 +216,15 @@ export default function App() {
       return;
     }
 
+    const loadVoices = () => synth.getVoices?.() || [];
+    let voices = loadVoices();
+    if (!voices.length) {
+      try {
+        synth.cancel();
+      } catch {}
+      voices = loadVoices();
+    }
+
     synth.cancel();
     isSpeakingRef.current = true;
 
@@ -223,6 +232,16 @@ export default function App() {
     utterance.pitch = 0.96;
     utterance.rate = 0.97;
     utterance.volume = 1;
+    utterance.lang = "en-US";
+
+    const preferred =
+      voices.find((v) => /en(-|_)US/i.test(v.lang) && /Google|Samantha|Microsoft|English/i.test(v.name)) ||
+      voices.find((v) => /en/i.test(v.lang));
+
+    if (preferred) {
+      utterance.voice = preferred;
+      utterance.lang = preferred.lang || "en-US";
+    }
 
     utterance.onstart = () => {
       setMode("speaking");
@@ -245,7 +264,14 @@ export default function App() {
       setMode("error");
     };
 
-    synth.speak(utterance);
+    setTimeout(() => {
+      try {
+        synth.speak(utterance);
+      } catch {
+        isSpeakingRef.current = false;
+        setMode("error");
+      }
+    }, 80);
   };
 
   const getModeConfig = () => {
